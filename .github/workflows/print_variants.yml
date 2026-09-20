@@ -1,0 +1,135 @@
+# MOVED HERE from pokemon-card-db (repo-split completion): the data this
+# automation edits (data/cards.json) lives in THIS repo now - pokemon-card-db
+# keeps the scripts/tools but gitignores the data. This workflow therefore
+# checks out BOTH: this repo's data-review branch at the root, and
+# pokemon-card-db (read-only, for scripts/ and tools/) into tooling/.
+# pokemon-card-db is private, so the tooling checkout uses the
+# TOOLING_REPO_TOKEN secret (fine-grained PAT, read-only Contents on that
+# one repo) - see that step's own comment.
+# Runs scripts/backfill_print_variants.py (splits data/cards.json rows
+# into real print_variant rows using ONLY verified signal from the hand-
+# maintained Google Sheet - see that script's own docstring for the full
+# "verified, not inferred" policy) and opens a pull request with whatever
+# it found, for human review. Never commits straight to data-review and
+# never auto-merges - see README.md's "Backfill automation" section for
+# the full data-review -> PR -> tools/cut_release.py flow this feeds into
+# (identical to backfill.yml's and discover.yml's).
+#
+# Deliberately workflow_dispatch-ONLY (no cron schedule), unlike
+# backfill.yml (weekly) and discover.yml (monthly): the sheet this reads
+# only covers ~600 already-finished WOTC-era cards, which essentially
+# never change - there's no "newly released set" or "field someone just
+# filled in" reason for this to need to re-run on its own regularly the
+# way those two do. Run by hand whenever the sheet itself might have been
+# updated, or after a fresh scripts/discover_missing_cards.py pass adds
+# WOTC-era cards this hasn't had a chance to check yet.
+name: Print-variant backfill (from PokéDex sheet)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: card-data-print-variants
+  cancel-in-progress: false
+
+jobs:
+  print-variants:
+    runs-on: ubuntu-latest
+    # The sheet is fetched once (~600 rows) and matched entirely in
+    # memory (see scripts/lookup/pokedex_sheet_lookup.py's own docstring)
+    # - no per-card network requests, so this should finish in well under
+    # a minute even in the worst case. Generous timeout purely as a hard
+    # stop against a genuinely stuck run, same reasoning as the other two
+    # workflows.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout data-review branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-review
+
+      - name: Checkout pokemon-card-db (scripts/tools)
+        uses: actions/checkout@v4
+        with:
+          repository: MyKale92/pokemon-card-db
+          path: tooling
+          # pokemon-card-db is PRIVATE (deliberately - see this repo's
+          # README) - a fine-grained PAT with read-only Contents access
+          # to that one repo, stored as the TOOLING_REPO_TOKEN secret
+          # here, is required for this checkout. Read-only on purpose:
+          # this workflow never writes anything back to the tooling repo.
+          token: ${{ secrets.TOOLING_REPO_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No requirements.txt install needed - scripts/backfill_print_variants.py,
+      # scripts/cards_store.py, and scripts/lookup/pokedex_sheet_variants.py/
+      # pokedex_sheet_lookup.py are all pure standard library, same as
+      # every other script in this repo.
+      - name: Run print-variant backfill (unattended)
+        run: python3 tooling/scripts/backfill_print_variants.py --yes --data-file data/cards.json
+
+      - name: Check whether anything actually changed
+        id: changes
+        run: |
+          if git diff --quiet -- data/cards.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No verified print-variant splits found this run - nothing to open a PR for."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Mandatory pre-flight gate, identical to backfill.yml's/discover.yml's
+      # and tools/cut_release.py's - this is the ONE check that actually
+      # matters most for this specific script: a bug in the relabel/new-
+      # row logic that produced a genuine (product_id, print_variant)
+      # collision would be caught right here, before it ever reaches a PR.
+      - name: Validate updated data
+        if: steps.changes.outputs.changed == 'true'
+        run: python3 tooling/tools/validate_data.py --data-file data/cards.json --strict
+
+      - name: Open pull request for review
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: print-variants/${{ github.run_id }}
+          base: data-review
+          commit-message: "Print-variant backfill run ${{ github.run_id }}"
+          title: "Print-variant backfill run ${{ github.run_id }}"
+          add-paths: data/cards.json
+          body: |
+            Automated run of `scripts/backfill_print_variants.py` against
+            `data-review`'s current `data/cards.json`, using ONLY verified
+            signal from the hand-maintained PokéDex Google Sheet (its own
+            "Rarity / Variant" column and Set-column print-run qualifiers
+            like "1st Edition"/"Unlimited"/"Shadowless") - never an
+            inferred/guessed split.
+
+            **This is a review-only PR** - merging it updates `data-review`,
+            not `main` and not any published release. A maintainer should:
+            1. Read the run's own console output (job log above) for the
+               full per-card breakdown, especially anything marked
+               **AMBIGUOUS** - those were deliberately left untouched
+               because this script couldn't confidently tell which
+               existing row already represents which sheet-verified
+               variant, and may be worth reconciling by hand.
+            2. Review the diff - every change here is either a relabeled
+               `print_variant` on an existing row, or a brand-new row
+               sharing an existing `product_id` under a different
+               `print_variant`. Nothing here modifies any other field on
+               an existing row.
+            3. Merge if it looks right.
+            4. Periodically run `tools/cut_release.py` from `data-review`
+               to publish the accumulated changes as a new GitHub Release.
+
+            `tools/validate_data.py --strict` passed against the result
+            before this PR was opened.
+          delete-branch: true

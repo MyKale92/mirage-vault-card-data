@@ -1,0 +1,134 @@
+# MOVED HERE from pokemon-card-db (repo-split completion): the data this
+# automation edits (data/cards.json) lives in THIS repo now - pokemon-card-db
+# keeps the scripts/tools but gitignores the data. This workflow therefore
+# checks out BOTH: this repo's data-review branch at the root, and
+# pokemon-card-db (read-only, for scripts/ and tools/) into tooling/.
+# pokemon-card-db is private, so the tooling checkout uses the
+# TOOLING_REPO_TOKEN secret (fine-grained PAT, read-only Contents on that
+# one repo) - see that step's own comment.
+# Runs scripts/bulbapedia_backfill.py (cross-references Bulbapedia,
+# pkmncards.com, tcgcollector.com, and a hand-maintained PokéDex Google
+# Sheet - see that script's own docstring) on a weekly schedule and opens
+# a pull request with whatever it found, for human review. Never commits
+# straight to data-review and never auto-merges - see README.md's
+# "Backfill automation" section for the full data-review -> PR ->
+# tools/cut_release.py flow this feeds into.
+name: Weekly data backfill
+
+on:
+  schedule:
+    # Monday 06:00 UTC - once a week, comfortably spaced out both to stay
+    # polite toward the external sites this script queries and to keep
+    # each run's batch (see --limit below) making steady, boring progress
+    # rather than needing to rush through a huge backlog.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max number of cards to process this run (courtesy-rate-limited against 4 external sites - keep this conservative)"
+        required: false
+        default: "400"
+
+# Only ever needs to push a new branch + open a PR - never write access to
+# main, and never merge/write access to data-review directly (the PR this
+# creates targets data-review but still requires a human to actually
+# click merge).
+permissions:
+  contents: write
+  pull-requests: write
+
+# If a run is somehow still going (or queued) when the next scheduled run
+# would start, let the new one wait rather than run two backfill passes
+# against the same sites concurrently.
+concurrency:
+  group: card-data-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # Generous but bounded - scripts/bulbapedia_backfill.py's own est_minutes
+    # print (~3x the courtesy delay per card) means even a 400-card batch
+    # should finish well under an hour; this is a hard stop so a genuinely
+    # stuck run (a source going unresponsive rather than just slow) doesn't
+    # burn Actions minutes indefinitely.
+    timeout-minutes: 120
+    steps:
+      - name: Checkout data-review branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-review
+
+      - name: Checkout pokemon-card-db (scripts/tools)
+        uses: actions/checkout@v4
+        with:
+          repository: MyKale92/pokemon-card-db
+          path: tooling
+          # pokemon-card-db is PRIVATE (deliberately - see this repo's
+          # README) - a fine-grained PAT with read-only Contents access
+          # to that one repo, stored as the TOOLING_REPO_TOKEN secret
+          # here, is required for this checkout. Read-only on purpose:
+          # this workflow never writes anything back to the tooling repo.
+          token: ${{ secrets.TOOLING_REPO_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No requirements.txt install needed here - scripts/bulbapedia_backfill.py
+      # and every scripts/lookup/*.py module it uses are pure standard
+      # library on purpose (see README.md's "Running the backfill script").
+      - name: Run backfill (batched, unattended)
+        run: |
+          python3 tooling/scripts/bulbapedia_backfill.py --yes --data-file data/cards.json \
+            --limit "${{ github.event.inputs.limit || 400 }}"
+
+      - name: Check whether anything actually changed
+        id: changes
+        run: |
+          if git diff --quiet -- data/cards.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No fields were filled in this run - nothing to open a PR for."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Mandatory pre-flight gate, same one tools/cut_release.py runs
+      # before packaging a release - a backfill run that somehow produced
+      # bad data (duplicate IDs, malformed URLs, ...) should fail this
+      # job loudly rather than open a PR proposing it.
+      - name: Validate updated data
+        if: steps.changes.outputs.changed == 'true'
+        run: python3 tooling/tools/validate_data.py --data-file data/cards.json --strict
+
+      - name: Open pull request for review
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: backfill/${{ github.run_id }}
+          base: data-review
+          commit-message: "Weekly backfill run ${{ github.run_id }}"
+          title: "Weekly backfill run ${{ github.run_id }}"
+          add-paths: data/cards.json
+          body: |
+            Automated run of `scripts/bulbapedia_backfill.py` (cross-referencing
+            Bulbapedia, pkmncards.com, tcgcollector.com, and the PokéDex sheet -
+            see that script's own docstring for how conflicting sources are
+            handled) against `data-review`'s current `data/cards.json`,
+            `--limit ${{ github.event.inputs.limit || 400 }}`.
+
+            **This is a review-only PR** - merging it updates `data-review`,
+            not `main` and not any published release. A maintainer should:
+            1. Review the diff (every changed field is a fill-in-a-blank,
+               never an overwrite - see `scripts/cards_store.py`'s
+               `upsert_card_fields(..., fill_gaps_only=True)`).
+            2. Merge if it looks right.
+            3. Periodically run `tools/cut_release.py` from `data-review`
+               to publish the accumulated changes as a new GitHub Release,
+               whenever there's enough to be worth publishing.
+
+            `tools/validate_data.py --strict` passed against the result
+            before this PR was opened.
+          delete-branch: true

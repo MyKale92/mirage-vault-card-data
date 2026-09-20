@@ -1,0 +1,156 @@
+# MOVED HERE from pokemon-card-db (repo-split completion): the data this
+# automation edits (data/cards.json) lives in THIS repo now - pokemon-card-db
+# keeps the scripts/tools but gitignores the data. This workflow therefore
+# checks out BOTH: this repo's data-review branch at the root, and
+# pokemon-card-db (read-only, for scripts/ and tools/) into tooling/.
+# pokemon-card-db is private, so the tooling checkout uses the
+# TOOLING_REPO_TOKEN secret (fine-grained PAT, read-only Contents on that
+# one repo) - see that step's own comment.
+# Runs scripts/discover_new_cards.py (checks pkmncards.com's most
+# recently added sets for cards this dataset doesn't have a row for yet
+# - see that script's own docstring) on a monthly schedule and opens a
+# pull request with whatever it found, for human review. Deliberately
+# separate from backfill.yml (weekly) rather than bolted onto it - new
+# sets release much less often than existing rows get their blank fields
+# filled in, so running this weekly would mostly just be wasted requests
+# against pkmncards.com re-checking sets that haven't changed. Never
+# commits straight to data-review and never auto-merges - see
+# README.md's "Backfill automation" section for the full
+# data-review -> PR -> tools/cut_release.py flow this feeds into
+# (identical to backfill.yml's).
+#
+# This only covers NEWLY RELEASED sets going forward. For a full,
+# one-time-or-occasional scan across every set pkmncards.com has ever
+# known about (catching older, already-partially-tracked sets that are
+# still missing a card or two), see scripts/discover_missing_cards.py -
+# that one is deliberately NOT wired into any scheduled workflow, since
+# a full catalog scan can take 30+ minutes and is meant to be run by
+# hand occasionally rather than on a tight schedule (see that script's
+# own docstring and README.md).
+name: Monthly new-card discovery
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of each month - new sets release roughly every
+    # few months at most, so monthly is already generous; --max-sets
+    # below is the real safety net in case pkmncards.com's index ever
+    # jumps by more than expected between runs.
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+    inputs:
+      max_sets:
+        description: "How many of pkmncards.com's most recently added sets to check this run"
+        required: false
+        default: "10"
+
+# Same reasoning as backfill.yml: only ever needs to push a new branch +
+# open a PR, never write access to main or merge/write access to
+# data-review directly.
+permissions:
+  contents: write
+  pull-requests: write
+
+# If a run is somehow still going (or queued) when the next scheduled run
+# would start, let the new one wait rather than run two discovery passes
+# against pkmncards.com concurrently.
+concurrency:
+  group: card-data-discover
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    # A handful of newly-added sets at pkmncards.com's 1.5s courtesy
+    # delay should finish in a few minutes even in the worst case; this
+    # is a hard stop so a genuinely stuck run doesn't burn Actions
+    # minutes indefinitely (same reasoning/value as backfill.yml's).
+    timeout-minutes: 60
+    steps:
+      - name: Checkout data-review branch
+        uses: actions/checkout@v4
+        with:
+          ref: data-review
+
+      - name: Checkout pokemon-card-db (scripts/tools)
+        uses: actions/checkout@v4
+        with:
+          repository: MyKale92/pokemon-card-db
+          path: tooling
+          # pokemon-card-db is PRIVATE (deliberately - see this repo's
+          # README) - a fine-grained PAT with read-only Contents access
+          # to that one repo, stored as the TOOLING_REPO_TOKEN secret
+          # here, is required for this checkout. Read-only on purpose:
+          # this workflow never writes anything back to the tooling repo.
+          token: ${{ secrets.TOOLING_REPO_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No requirements.txt install needed here either - scripts/discover_new_cards.py,
+      # scripts/discover_common.py, and scripts/lookup/pkmncards_catalog.py are
+      # all pure standard library on purpose, same as the backfill script.
+      - name: Run new-card discovery (unattended)
+        run: |
+          python3 tooling/scripts/discover_new_cards.py --yes --data-file data/cards.json \
+            --max-sets "${{ github.event.inputs.max_sets || 10 }}"
+
+      - name: Check whether anything actually changed
+        id: changes
+        run: |
+          if git diff --quiet -- data/cards.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No new cards found this run - nothing to open a PR for."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Mandatory pre-flight gate, identical to backfill.yml's and
+      # tools/cut_release.py's - new rows this script adds only ever set
+      # product_id/card_name/set_name/number/rarity/artist/category (see
+      # scripts/discover_common.py's build_new_card_row), but this still
+      # catches an accidental duplicate product_id or malformed field
+      # before it ever reaches a PR.
+      - name: Validate updated data
+        if: steps.changes.outputs.changed == 'true'
+        run: python3 tooling/tools/validate_data.py --data-file data/cards.json --strict
+
+      - name: Open pull request for review
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: discover/${{ github.run_id }}
+          base: data-review
+          commit-message: "Monthly new-card discovery run ${{ github.run_id }}"
+          title: "Monthly new-card discovery run ${{ github.run_id }}"
+          add-paths: data/cards.json
+          body: |
+            Automated run of `scripts/discover_new_cards.py` against
+            `data-review`'s current `data/cards.json`, checking
+            pkmncards.com's `${{ github.event.inputs.max_sets || 10 }}`
+            most recently added sets for cards this dataset doesn't have
+            a row for yet (matched by TCGplayer product ID - see that
+            script's docstring).
+
+            **This is a review-only PR** - merging it updates `data-review`,
+            not `main` and not any published release. New rows here start
+            out mostly blank (product_id/card_name/set_name/number plus
+            whatever pkmncards.com's listing page shows for free) - the
+            regular weekly backfill (`backfill.yml`) will fill in the rest
+            on its own next run, the same as any other incomplete row. A
+            maintainer should:
+            1. Review the diff (every change here is a brand-new row, never
+               a modification to an existing one).
+            2. Merge if it looks right.
+            3. Periodically run `tools/cut_release.py` from `data-review`
+               to publish the accumulated changes as a new GitHub Release.
+
+            `tools/validate_data.py --strict` passed against the result
+            before this PR was opened.
+
+            For a full retroactive scan across every set (not just newly
+            released ones), see `scripts/discover_missing_cards.py` - run
+            by hand, not part of this or any scheduled workflow.
+          delete-branch: true

@@ -18,7 +18,19 @@ keeping the tooling's source private.
 
 ## What's here
 
-Nothing but GitHub Releases. Each release is tagged `vX.Y.Z` and carries:
+Two things now (updated when the weekly automation moved in - see below):
+
+1. **`data/cards.json` on the `data-review` branch** - the live working
+   copy of the dataset. The scheduled automation (weekly backfill,
+   monthly new-set discovery - workflows in `.github/workflows/`, which
+   check out the private tooling repo for their scripts) opens PRs
+   against `data-review`; a human reviews and merges; `main` and the
+   Releases only ever advance when a release is cut from the reviewed
+   state.
+2. **GitHub Releases** - the published, versioned snapshots the consuming
+   tools actually download.
+
+Releases are the ONLY thing consumers should fetch. Each release is tagged `vX.Y.Z` and carries:
 
 - `cards.json` - the card identity dataset for that version
 - `images_part001.tar` ... `images_partNNN.tar` - card images, packed
